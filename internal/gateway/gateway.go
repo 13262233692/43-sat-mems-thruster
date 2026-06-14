@@ -1,14 +1,13 @@
 package gateway
 
 import (
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cubesat/mems-thruster-gateway/internal/attitude"
-	"github.com/cubesat/mems-thruster-gateway/internal/buffer"
 	"github.com/cubesat/mems-thruster-gateway/internal/capture"
 	"github.com/cubesat/mems-thruster-gateway/internal/config"
+	"github.com/cubesat/mems-thruster-gateway/internal/lockfree"
 	"github.com/cubesat/mems-thruster-gateway/internal/safety"
 	"github.com/cubesat/mems-thruster-gateway/internal/thrust"
 	"github.com/cubesat/mems-thruster-gateway/pkg/types"
@@ -20,11 +19,11 @@ type ThrusterGateway struct {
 	captureGw  *capture.Gateway
 	safetyMon  *safety.Monitor
 	estimator  *thrust.FastEstimator
-	buffer     *buffer.RingBuffer
 	controller *attitude.Controller
 	decision   *attitude.DecisionEngine
 
-	streamProc *buffer.StreamProcessor
+	sampleRing *lockfree.SPSCRing
+	latestRing *lockfree.SPSCRing
 
 	running atomic.Bool
 	closeCh chan struct{}
@@ -33,10 +32,10 @@ type ThrusterGateway struct {
 	commandCount uint64
 	dropCount    uint64
 
-	mu sync.RWMutex
-
 	commandCallback func([]types.ThrustCommand)
 	statusCallback  func(types.SafetyStatus, uint8)
+
+	processCloseCh chan struct{}
 }
 
 func New(cfg *config.GatewayConfig) *ThrusterGateway {
@@ -45,8 +44,9 @@ func New(cfg *config.GatewayConfig) *ThrusterGateway {
 	}
 
 	gw := &ThrusterGateway{
-		config:    cfg,
-		closeCh:   make(chan struct{}),
+		config:         cfg,
+		closeCh:        make(chan struct{}),
+		processCloseCh: make(chan struct{}),
 	}
 
 	gw.captureGw = capture.NewGateway(cfg.NetworkInterface, cfg.BPFFilter)
@@ -55,11 +55,10 @@ func New(cfg *config.GatewayConfig) *ThrusterGateway {
 		cfg.ThrustEstimationModel.ThrustCoefficients,
 		cfg.ThrustEstimationModel.TorqueCoefficients,
 	)
-	gw.buffer = buffer.NewRingBuffer(cfg.SampleBufferSize)
+	gw.sampleRing = lockfree.NewSPSCRing(cfg.SampleBufferSize)
+	gw.latestRing = lockfree.NewSPSCRing(1024)
 	gw.controller = attitude.NewController(cfg.AttitudeControl, cfg.ThrusterCount)
 	gw.decision = attitude.NewDecisionEngine(gw.controller, gw.safetyMon)
-
-	gw.streamProc = buffer.NewStreamProcessor(cfg.SampleBufferSize, 100, 50)
 
 	return gw
 }
@@ -73,16 +72,14 @@ func (gw *ThrusterGateway) Start() error {
 	gw.captureGw.SetErrorCallback(gw.onCaptureError)
 	gw.safetyMon.AddCallback(gw.onSafetyEvent)
 	gw.controller.SetCommandCallback(gw.onCommands)
-	gw.streamProc.SetCallback(gw.onProcessWindow)
 
 	if err := gw.captureGw.Start(); err != nil {
 		return err
 	}
 
-	gw.streamProc.Start()
-
 	gw.running.Store(true)
 	go gw.processLoop()
+	go gw.attitudeUpdateLoop()
 
 	return nil
 }
@@ -94,22 +91,24 @@ func (gw *ThrusterGateway) Stop() {
 
 	gw.running.Store(false)
 	gw.captureGw.Stop()
-	gw.streamProc.Stop()
 	close(gw.closeCh)
+	close(gw.processCloseCh)
 }
 
 func (gw *ThrusterGateway) onSamples(samples []types.ThrusterSample) {
 	gw.estimator.EstimateBatch(samples)
 	gw.safetyMon.CheckBatch(samples)
 
-	n := gw.buffer.Write(samples)
+	n := gw.sampleRing.WriteBatch(samples)
 	if n < len(samples) {
 		atomic.AddUint64(&gw.dropCount, uint64(len(samples)-n))
 	}
 
-	gw.streamProc.Write(samples)
+	for i := 0; i < n; i++ {
+		gw.latestRing.Write(samples[i])
+	}
 
-	atomic.AddUint64(&gw.sampleCount, uint64(len(samples)))
+	atomic.AddUint64(&gw.sampleCount, uint64(n))
 }
 
 func (gw *ThrusterGateway) onCaptureError(err error) {
@@ -134,20 +133,29 @@ func (gw *ThrusterGateway) onCommands(commands []types.ThrustCommand) {
 	}
 }
 
-func (gw *ThrusterGateway) onProcessWindow(window []types.ThrusterSample) {
-	_ = window
+func (gw *ThrusterGateway) processLoop() {
+	batch := make([]types.ThrusterSample, 256)
+
+	for gw.running.Load() {
+		n := gw.sampleRing.ReadBatch(batch)
+		if n == 0 {
+			time.Sleep(1 * time.Microsecond)
+			continue
+		}
+
+		_ = batch[:n]
+	}
 }
 
-func (gw *ThrusterGateway) processLoop() {
-	ticker := time.NewTicker(10 * time.Millisecond)
+func (gw *ThrusterGateway) attitudeUpdateLoop() {
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	for gw.running.Load() {
 		select {
 		case <-ticker.C:
 			timestamp := uint64(time.Now().UnixNano())
-			commands := gw.decision.Process(timestamp)
-			_ = commands
+			gw.decision.Process(timestamp)
 		case <-gw.closeCh:
 			return
 		}
@@ -194,15 +202,15 @@ func (gw *ThrusterGateway) Stats() GatewayStats {
 		SamplesProcessed: atomic.LoadUint64(&gw.sampleCount),
 		CommandsIssued:   atomic.LoadUint64(&gw.commandCount),
 		SamplesDropped:   atomic.LoadUint64(&gw.dropCount),
-		BufferUsed:       gw.buffer.Count(),
-		BufferCapacity:   gw.buffer.Capacity(),
+		BufferUsed:       gw.sampleRing.Count(),
+		BufferCapacity:   gw.sampleRing.Capacity(),
 		CaptureStats:     capStats,
 		SafetyStatus:     gw.safetyMon.Status(),
 	}
 }
 
 func (gw *ThrusterGateway) GetLatestSamples(n int) []types.ThrusterSample {
-	return gw.buffer.PeekLatest(n)
+	return gw.latestRing.PeekLatest(n)
 }
 
 func (gw *ThrusterGateway) IsHealthy() bool {
@@ -211,4 +219,8 @@ func (gw *ThrusterGateway) IsHealthy() bool {
 
 func (gw *ThrusterGateway) SafetyStatus() types.SafetyStatus {
 	return gw.safetyMon.Status()
+}
+
+func (gw *ThrusterGateway) ReadSamples(out []types.ThrusterSample) int {
+	return gw.sampleRing.ReadBatch(out)
 }
